@@ -1,12 +1,14 @@
-// App entry: init store, wire header/toolbar, ffmpeg check, shortcuts, DnD drop.
+// App entry: init store, wire header/toolbar, ffmpeg check, shortcuts, OS + custom DnD.
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { Store, newProject, Project, Media, clipLength } from "./state";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { Store, newProject, Project, Media, migrateProject } from "./state";
 import { Timeline } from "./timeline";
 import { Preview } from "./preview";
 import { MediaBin } from "./mediabin";
+import { MosaicUI } from "./mosaicui";
 import { ExportUI } from "./exportui";
 import { initUpdater } from "./updater";
-import { checkFfmpeg, saveProject, loadProject } from "./ipc";
+import { checkFfmpeg, saveProject, loadProject, probeMedia, makeThumbnail } from "./ipc";
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string): T => {
   const el = document.querySelector(sel);
@@ -23,6 +25,7 @@ const hiddenHost = $("#hidden-media");
 const preview = new Preview(previewCanvas, store, hiddenHost);
 const timeline = new Timeline(timelineCanvas, store);
 const mediabin = new MediaBin(store, $("#media-list"), $("#btn-add-media"));
+const mosaicUI = new MosaicUI(store, preview, previewCanvas, $("#mosaic-panel"));
 const exportUI = new ExportUI(store);
 
 // ---- title / dirty mark ----
@@ -97,7 +100,7 @@ async function doOpen(): Promise<void> {
   if (!path || Array.isArray(path)) return;
   try {
     const json = await loadProject(path);
-    const proj = JSON.parse(json) as Project;
+    const proj = migrateProject(JSON.parse(json) as Project);
     // restore front-only fields (name) for media
     for (const m of proj.media) {
       if (!m.name) m.name = m.path.split(/[\\/]/).pop() || m.path;
@@ -169,6 +172,11 @@ window.addEventListener("keydown", (e) => {
     return;
   }
   if (isTyping()) return;
+  // mosaic keyframe shortcuts (K/H) when a clip + region is selected
+  if ((e.key === "k" || e.key === "K" || e.key === "h" || e.key === "H") && mosaicUI.handleKey(e.key)) {
+    e.preventDefault();
+    return;
+  }
   if (e.key === " ") {
     e.preventDefault();
     preview.togglePlay();
@@ -185,65 +193,101 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-// ---- DnD: media card -> timeline ----
-timelineCanvas.addEventListener("dragover", (e) => {
-  if (e.dataTransfer?.types.includes("text/media-id")) {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "copy";
+// ---- media placement (shared by custom drag + OS DnD) ----
+// Drop media at a screen position: onto the timeline if over it, else bin-only.
+function dropMediaAtScreen(media: Media, clientX: number, clientY: number): void {
+  const kind = media.kind === "audio" ? "audio" : "video";
+  const resolved = timeline.resolveDrop(clientX, clientY, kind);
+  if (resolved) {
+    timeline.placeMedia(media, (m, start) => mediabin.makeClip(m, start), resolved.trackIndex, resolved.sec);
   }
-});
-timelineCanvas.addEventListener("drop", (e) => {
-  const mediaId = e.dataTransfer?.getData("text/media-id");
-  if (!mediaId) return;
-  e.preventDefault();
-  const media = store.mediaById(mediaId);
-  if (!media) return;
-  dropMediaAt(media, e);
-});
-
-function dropMediaAt(media: Media, e: DragEvent): void {
-  const HEADER_W = 110;
-  const RULER_H = 26;
-  const TRACK_H = 64;
-  const TRACK_GAP = 2;
-  const rect = timelineCanvas.getBoundingClientRect();
-  const x = e.clientX - rect.left;
-  const y = e.clientY - rect.top;
-  let sec = store.scrollSec + (x - HEADER_W) / store.pxPerSec;
-  if (sec < 0) sec = 0;
-
-  // determine track under cursor
-  let trackIndex = -1;
-  if (y >= RULER_H) {
-    const idx = Math.floor((y - RULER_H) / (TRACK_H + TRACK_GAP));
-    if (idx >= 0 && idx < store.project.tracks.length) trackIndex = idx;
-  }
-  const wantKind = media.kind === "audio" ? "audio" : "video";
-  let track =
-    trackIndex >= 0 && store.project.tracks[trackIndex].kind === wantKind
-      ? store.project.tracks[trackIndex]
-      : store.project.tracks.find((t) => t.kind === wantKind);
-  if (!track) return;
-
-  const clip = mediabin.makeClip(media, sec);
-  const len = clipLength(clip);
-  // avoid overlap: push to nearest free spot after sec
-  const targetTrack = track;
-  let start = sec;
-  const sorted = [...targetTrack.clips].sort((a, b) => a.start - b.start);
-  for (const c of sorted) {
-    const cs = c.start;
-    const ce = c.start + clipLength(c);
-    if (start < ce && start + len > cs) {
-      start = ce; // move past this clip
-    }
-  }
-  clip.start = start;
-  store.commit(() => {
-    targetTrack.clips.push(clip);
-    store.selectedClipId = clip.id;
-  });
+  // bin-only when not over the timeline (media already exists in bin)
 }
+
+// Highlight the timeline drop target during a drag.
+function hintDrop(media: Media | null, clientX: number, clientY: number): void {
+  if (!media) {
+    timeline.setDropHint(null);
+    return;
+  }
+  const kind = media.kind === "audio" ? "audio" : "video";
+  timeline.setDropHint(timeline.resolveDrop(clientX, clientY, kind));
+}
+
+mediabin.setDropHandler(dropMediaAtScreen, hintDrop);
+
+// ---- OS drag & drop (Tauri webview) ----
+const MEDIA_EXTS = new Set([
+  "mp4", "mov", "mkv", "webm", "avi", "m4v",
+  "mp3", "wav", "aac", "flac", "ogg", "m4a",
+  "jpg", "jpeg", "png", "gif", "bmp", "webp",
+]);
+
+function isMediaPath(p: string): boolean {
+  const ext = p.split(".").pop()?.toLowerCase() || "";
+  return MEDIA_EXTS.has(ext);
+}
+
+// PhysicalPosition -> client (CSS) coords.
+function physToClient(pos: { x: number; y: number }): { x: number; y: number } {
+  const dpr = window.devicePixelRatio || 1;
+  return { x: pos.x / dpr, y: pos.y / dpr };
+}
+
+// Import a dropped path into the media bin, returning the created Media.
+async function importDroppedPath(path: string): Promise<Media | null> {
+  try {
+    const info = await probeMedia(path);
+    const name = path.split(/[\\/]/).pop() || path;
+    const media: Media = {
+      id: `m${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+      path,
+      kind: info.kind,
+      duration: info.duration,
+      width: info.width,
+      height: info.height,
+      fps: info.fps,
+      hasAudio: info.hasAudio,
+      name,
+    };
+    let thumb = "";
+    try {
+      thumb = await makeThumbnail(path, Math.min(1, info.duration / 2 || 0));
+    } catch {
+      thumb = "";
+    }
+    media.thumb = thumb;
+    store.commit(() => {
+      store.project.media.push(media);
+    });
+    return media;
+  } catch (e) {
+    console.error("OS drop import failed", path, e);
+    return null;
+  }
+}
+
+void getCurrentWebview().onDragDropEvent((event) => {
+  const p = event.payload;
+  if (p.type === "over") {
+    const c = physToClient(p.position);
+    // highlight whichever target the cursor is over (track or null)
+    const overTimeline = timeline.resolveDrop(c.x, c.y, "video") || timeline.resolveDrop(c.x, c.y, "audio");
+    timeline.setDropHint(overTimeline);
+  } else if (p.type === "leave") {
+    timeline.setDropHint(null);
+  } else if (p.type === "drop") {
+    timeline.setDropHint(null);
+    const c = physToClient(p.position);
+    const paths = p.paths.filter((pp) => isMediaPath(pp) && !pp.toLowerCase().endsWith(".vep"));
+    void (async () => {
+      for (const path of paths) {
+        const media = await importDroppedPath(path);
+        if (media) dropMediaAtScreen(media, c.x, c.y);
+      }
+    })();
+  }
+});
 
 // ---- ffmpeg check ----
 async function runFfmpegCheck(): Promise<void> {

@@ -1,4 +1,98 @@
-# vidEdit — 設計書 (v1)
+# vidEdit — 設計書
+
+> v1 = 0.1.0 の基本設計(後半)。v2 = 0.2.0 追加機能(直下)。
+
+# v2 追加設計 (0.2.0)
+
+## A. OSからのドラッグ&ドロップ
+
+- Tauri の drag-drop インターセプト(`dragDropEnabled` 既定 true)を利用。フロントは `getCurrentWebview().onDragDropEvent` を購読。
+  - `over`: PhysicalPosition / devicePixelRatio → client 座標。メディアビン領域/タイムライン canvas 上ならハイライト表示。
+  - `drop`: 各 path を probe_media + make_thumbnail で取り込み(.vep は除外)。ドロップ先がタイムライン canvas ならドロップ位置のトラック/時刻へ順次配置(既存の重なり回避ロジック)。それ以外はビンへの追加のみ。
+- **注意**: dragDropEnabled=true の環境では HTML5 DnD が WebView2 で機能しない。メディアビン→タイムラインの内部ドラッグは mousedown ベースの自前実装(ゴースト表示、mouseup 位置で配置)に置き換える。
+
+## B. ギャップ選択とリップル削除
+
+- タイムラインのトラック上の空白(クリップとクリップの間、または 0 秒〜先頭クリップ)をクリック → ギャップ選択 `{trackId, start, end}`(右端は必ず次クリップの start。右側にクリップがない空白は選択不可)。斜線ハッチでハイライト。
+- Delete/Backspace でリップル削除: そのトラック上の `clip.start >= gap.end - ε` の全クリップを `gap.end - gap.start` 秒だけ左へシフト(undo 可能な 1 commit)。
+
+## C. モザイク機能 (wvmTool 参考)
+
+### データモデル (.vep version: 2)
+
+```jsonc
+// Clip に追加(省略時 [])。v1 ファイルは mosaics=[] として読み込む。
+"mosaics": [
+  { "id": "mz1", "strength": 20, "enabled": true,
+    "keys": [
+      // t: クリップのタイムライン開始位置からの相対秒(τ)。昇順。
+      // x,y,w,h: プロジェクトフレームに対する正規化座標(0..1, x/y=左上)
+      { "t": 0.0, "x": 0.4, "y": 0.5, "w": 0.1, "h": 0.15, "visible": true }
+    ] }
+]
+```
+
+- 補間: keys 間は x/y/w/h を線形補間。最初の key より前は**非表示**。最後の key 以後は最終値を保持。`visible` はステップ(その key から次の key まで)。
+- strength = モザイク粒度 px (5..80)。回転は非対応(v1 の制限として明記)。
+
+### プレビュー/編集 UI
+
+- 選択クリップが video トラック上にあるとき、プレビュー下にモザイクパネル: 領域リスト(●/○ 有効切替、粒度スライダー 5–80、× 削除)、「+ 領域追加」、「自動モザイク」。
+- 「+ 領域追加」→ 描画モード: プレビュー上をドラッグで矩形描画 → 現在の τ に key 追加、自動で選択モードへ(wvmTool 同様)。
+- 選択モード: 矩形クリックで選択、ドラッグ移動、四隅ハンドル(8px)でリサイズ。編集時は現在 τ の key を更新(無ければ追加)= キーフレーム記録。`K`=現在位置に key 追加、`H`=表示/非表示 key 追加。
+- 一時停止中のみ枠線/ハンドル描画、再生中はモザイク効果のみ(wvmTool 同様)。
+- プレビューのモザイク描画: 該当矩形を小さなオフスクリーン canvas に縮小描画→ `imageSmoothingEnabled=false` で拡大して戻す。ブロックサイズはプレビュー縮尺に合わせ strength を比例縮小。
+
+### エクスポート (export.rs)
+
+各 video/image クリップのチェーン `...,fps={fps}` の直後・`format=yuva420p` の前に、enabled な領域ごとに挿入:
+
+```
+[cN]split=2[cNb][cNt];
+[cNt]crop=w={Wr}:h={Hr}:x='{XEXPR}':y='{YEXPR}',pixelize=width={P}:height={P}[cNm];
+[cNb][cNm]overlay=x='{XEXPR}':y='{YEXPR}':enable='{VIS}'[cN']
+```
+
+- Wr/Hr = keys 中の最大 w/h × プロジェクト W/H を 2 の倍数に切上げ(最小 16)。crop サイズは固定し、位置のみ時間変化。
+- XEXPR/YEXPR = keys の区分線形補間を `if(lt(t,t1), lerp式, if(...))` のネストで生成し、`clip(式, 0, {W-Wr})` でクランプ。t はチェーン内時刻 τ(trim 後 setpts=PTS-STARTPTS 済みのため)。数値は全てリテラルで埋め込む。
+- VIS = visible 区間の `between(t,a,b)` の和。全区間可視なら enable 省略。
+- P = clamp(strength, 4, min(Wr,Hr)/2)。
+- 自動生成 keys はエクスポート前にデータ側で間引かれている前提(下記)ため式長は問題にならない。
+
+## D. 自動モザイク(生殖器の自動検出)
+
+露出した生殖器を NudeNet v3 検出モデル(YOLOv8n, ONNX)で検出し、モザイク領域として自動追加する(モザイク義務化コンテンツの編集支援)。
+
+### IPC 追加
+
+| command | 引数 | 戻り値 |
+|---|---|---|
+| `auto_mosaic` | `path, inSec: f64, outSec: f64` | `Vec<MosaicRegion>`(async。keys.t は τ=srcT−inSec) |
+| `cancel_auto_mosaic` | なし | `()` |
+
+イベント `automosaic-progress`: `{ phase: "download" \| "detect", ratio: f64 }`
+
+### パイプライン (src-tauri/src/detect.rs)
+
+1. **モデル**: `{app_data_dir}/models/nudenet-640m.onnx`。無ければ `https://github.com/notAI-tech/NudeNet/releases/download/v3.4-weights/640m.onnx` から ureq でダウンロード(progress 発行、5MB 未満なら失敗扱い)。
+2. **フレーム抽出**: ffprobe で srcW/srcH 取得後、`ffmpeg -ss {in} -t {out-in} -i path -vf fps=3,scale=640:640:force_original_aspect_ratio=decrease,pad=640:640:0:0:color=black -f rawvideo -pix_fmt rgb24 pipe:1` を行(フレーム)単位でストリーム読み(640*640*3 bytes/frame)。pad 左上寄せなので座標逆変換は スケール s=640/max(srcW,srcH)、normalized = box_px / (src*s)。
+3. **推論**: tract-onnx(純Rust、ネイティブ依存なしで CI 3OS 安全)。入力 fact f32 [1,3,640,640]、RGB/255、CHW。出力 [1,22,8400](YOLOv8: 4bbox+18class、sigmoid 適用済み)。対象クラス index: **4 = FEMALE_GENITALIA_EXPOSED, 14 = MALE_GENITALIA_EXPOSED のみ**。conf>0.25 → xywh(center)→corner → クラス毎 NMS IoU 0.45 → 正規化座標へ逆変換。
+4. **時間方向グルーピング**: 直前ボックスとの IoU>0.3 かつ時間差≤0.75s なら同一トラックに連結、なければ新規。トラックごとに: ボックスを各辺 15% パディング(0..1 クランプ)→ key 列化(t=サンプル時刻−in)→ 線形補間で再現できる中間 key を間引き(許容誤差 0.01)→ 先頭 key の t を max(0, t−0.15) に前倒し(visible=true)、末尾に t=最終+0.15 の visible=false key を追加。
+5. region: id="auto-N", strength=20, enabled=true。面積×継続時間の大きい順に最大 16 個。
+6. キャンセル: AtomicBool + ffmpeg child kill。エラーはメッセージ付き Err(手動モザイクは影響なし)。
+
+### フロント
+
+- モザイクパネルの「自動モザイク」: 確認ダイアログ(初回はモデル約100MBをダウンロードする旨)→ progress モーダル(キャンセル可)→ 結果 regions を選択クリップに append(1 commit、undo 可)。image クリップは対象外(ボタン無効)。
+
+## E. その他
+
+- バージョン 0.2.0(package.json / Cargo.toml / tauri.conf.json)。.vep version 2(v1 読込可)。
+- release.yml の actions/checkout, setup-node を v5 へ(Node20 非推奨対応)。
+
+---
+
+# v1 基本設計 (0.1.0)
 
 軽量・高速なクロスプラットフォーム動画編集ソフト。Tauri 2 (Rust) + Vite/TypeScript(フレームワーク不使用、Canvas 描画)。
 

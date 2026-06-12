@@ -1,5 +1,6 @@
 // IPC wrappers around Tauri commands (snake_case on Rust side).
 import { invoke } from "@tauri-apps/api/core";
+import type { MosaicRegion } from "./state";
 
 export interface FfmpegStatus {
   ffmpeg: boolean;
@@ -42,4 +43,13 @@ export function exportVideo(projectJson: string, outPath: string): Promise<void>
 
 export function cancelExport(): Promise<void> {
   return invoke<void>("cancel_export");
+}
+
+// Auto-mosaic detection. keys.t are τ = srcT - inSec.
+export function autoMosaic(path: string, inSec: number, outSec: number): Promise<MosaicRegion[]> {
+  return invoke<MosaicRegion[]>("auto_mosaic", { path, inSec, outSec });
+}
+
+export function cancelAutoMosaic(): Promise<void> {
+  return invoke<void>("cancel_auto_mosaic");
 }

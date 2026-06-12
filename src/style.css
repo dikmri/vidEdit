@@ -355,3 +355,92 @@ body {
   gap: 8px;
   margin-top: 16px;
 }
+
+/* custom drag ghost (media bin -> timeline) */
+.drag-ghost {
+  position: fixed;
+  z-index: 200;
+  pointer-events: none;
+  background: rgba(124, 92, 255, 0.9);
+  color: #fff;
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  max-width: 200px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+}
+
+/* mosaic panel (below preview) */
+.mosaic-panel {
+  flex: 0 0 auto;
+  max-height: 180px;
+  overflow-y: auto;
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.mosaic-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.mosaic-head span {
+  margin-right: auto;
+}
+.mosaic-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.mosaic-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.mosaic-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px;
+  border-radius: 4px;
+  background: var(--bg-2);
+  border: 1px solid transparent;
+}
+.mosaic-row.selected {
+  border-color: var(--accent);
+}
+.mosaic-toggle,
+.mosaic-del {
+  background: transparent;
+  border: none;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0 2px;
+}
+.mosaic-del {
+  color: var(--danger);
+}
+.mosaic-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  min-width: 48px;
+}
+.mosaic-slider {
+  flex: 1 1 auto;
+  accent-color: var(--accent);
+}
+.automosaic-status {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+  min-height: 16px;
+  white-space: pre-line;
+}

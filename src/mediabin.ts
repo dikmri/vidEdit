@@ -1,22 +1,45 @@
-// Media bin: add media via dialog, probe + thumbnail, cards, DnD to timeline.
+// Media bin: add media via dialog, probe + thumbnail, cards, custom drag to timeline.
 import { open } from "@tauri-apps/plugin-dialog";
 import { Store, Media, Clip, uid, clipLength } from "./state";
 import { probeMedia, makeThumbnail } from "./ipc";
 
 const IMAGE_DEFAULT_DUR = 5; // seconds for image clip default
+const DRAG_THRESHOLD = 4; // px before a press becomes a drag
+
+// Drop handler: place media at a screen position (timeline) or bin-only.
+export type MediaDropFn = (media: Media, clientX: number, clientY: number) => void;
+// Hover handler during custom drag, for timeline highlight (null = not over timeline).
+export type MediaDragMoveFn = (media: Media | null, clientX: number, clientY: number) => void;
 
 export class MediaBin {
   private store: Store;
   private container: HTMLElement;
   private addBtn: HTMLElement;
+  private onDrop: MediaDropFn | null = null;
+  private onDragMove: MediaDragMoveFn | null = null;
+
+  // active custom drag state
+  private dragMedia: Media | null = null;
+  private dragging = false;
+  private downX = 0;
+  private downY = 0;
+  private ghost: HTMLElement | null = null;
 
   constructor(store: Store, container: HTMLElement, addBtn: HTMLElement) {
     this.store = store;
     this.container = container;
     this.addBtn = addBtn;
     this.addBtn.addEventListener("click", () => void this.addMedia());
+    window.addEventListener("mousemove", (e) => this.onDragMoveEvent(e));
+    window.addEventListener("mouseup", (e) => this.onDragUp(e));
     store.subscribe(() => this.render());
     this.render();
+  }
+
+  // Wire drop / hover handlers (placement logic lives in main.ts, shared with OS DnD).
+  setDropHandler(onDrop: MediaDropFn, onDragMove: MediaDragMoveFn): void {
+    this.onDrop = onDrop;
+    this.onDragMove = onDragMove;
   }
 
   async addMedia(): Promise<void> {
@@ -72,7 +95,6 @@ export class MediaBin {
     for (const m of this.store.project.media) {
       const card = document.createElement("div");
       card.className = "media-card";
-      card.draggable = true;
       card.dataset.mediaId = m.id;
 
       const thumb = document.createElement("div");
@@ -100,13 +122,61 @@ export class MediaBin {
       card.appendChild(thumb);
       card.appendChild(meta);
 
-      card.addEventListener("dragstart", (e) => {
-        e.dataTransfer?.setData("text/media-id", m.id);
-        if (e.dataTransfer) e.dataTransfer.effectAllowed = "copy";
+      // Custom mousedown-based drag (HTML5 DnD is broken under WebView2 dragDropEnabled).
+      card.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        this.dragMedia = m;
+        this.dragging = false;
+        this.downX = e.clientX;
+        this.downY = e.clientY;
       });
       card.addEventListener("dblclick", () => this.appendToTrack(m));
 
       this.container.appendChild(card);
+    }
+  }
+
+  private onDragMoveEvent(e: MouseEvent): void {
+    if (!this.dragMedia) return;
+    if (!this.dragging) {
+      if (Math.abs(e.clientX - this.downX) < DRAG_THRESHOLD && Math.abs(e.clientY - this.downY) < DRAG_THRESHOLD) {
+        return;
+      }
+      this.dragging = true;
+      this.makeGhost(this.dragMedia);
+    }
+    if (this.ghost) {
+      this.ghost.style.left = `${e.clientX + 8}px`;
+      this.ghost.style.top = `${e.clientY + 8}px`;
+    }
+    this.onDragMove?.(this.dragMedia, e.clientX, e.clientY);
+  }
+
+  private onDragUp(e: MouseEvent): void {
+    if (!this.dragMedia) return;
+    const media = this.dragMedia;
+    const wasDragging = this.dragging;
+    this.dragMedia = null;
+    this.dragging = false;
+    this.removeGhost();
+    this.onDragMove?.(null, e.clientX, e.clientY);
+    if (wasDragging) this.onDrop?.(media, e.clientX, e.clientY);
+  }
+
+  private makeGhost(m: Media): void {
+    this.removeGhost();
+    const g = document.createElement("div");
+    g.className = "drag-ghost";
+    g.textContent = m.name || m.path.split(/[\\/]/).pop() || "media";
+    document.body.appendChild(g);
+    this.ghost = g;
+  }
+
+  private removeGhost(): void {
+    if (this.ghost) {
+      this.ghost.remove();
+      this.ghost = null;
     }
   }
 
@@ -120,6 +190,7 @@ export class MediaBin {
       out: m.kind === "image" ? IMAGE_DEFAULT_DUR : m.duration,
       volume: 1,
       opacity: 1,
+      mosaics: [],
     };
   }
 
@@ -133,7 +204,7 @@ export class MediaBin {
     const clip = this.makeClip(m, end);
     this.store.commit(() => {
       track.clips.push(clip);
-      this.store.selectedClipId = clip.id;
+      this.store.selectClip(clip.id);
     });
   }
 }

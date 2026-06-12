@@ -24,6 +24,23 @@ export interface Media {
   thumb?: string;
 }
 
+// Mosaic keyframe: t = seconds relative to clip's timeline start (τ).
+export interface MosaicKey {
+  t: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  visible: boolean;
+}
+
+export interface MosaicRegion {
+  id: string;
+  strength: number;
+  enabled: boolean;
+  keys: MosaicKey[];
+}
+
 export interface Clip {
   id: string;
   mediaId: string;
@@ -32,6 +49,7 @@ export interface Clip {
   out: number;
   volume: number;
   opacity: number;
+  mosaics: MosaicRegion[];
 }
 
 export interface Track {
@@ -59,9 +77,66 @@ export function clipLength(c: Clip): number {
   return c.out - c.in;
 }
 
+// Selected gap on a track (empty span left of a clip). end is always next clip start.
+export interface GapSelection {
+  trackId: string;
+  start: number;
+  end: number;
+}
+
+export interface RegionRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  visible: boolean;
+}
+
+// Interpolate a region's rect at relative time τ. Returns null before first key.
+export function regionRectAt(region: MosaicRegion, t: number): RegionRect | null {
+  const keys = region.keys;
+  if (keys.length === 0) return null;
+  if (t < keys[0].t) return null; // hidden before first key
+  // find segment
+  let i = keys.length - 1;
+  for (let k = 0; k < keys.length; k++) {
+    if (keys[k].t > t) {
+      i = k - 1;
+      break;
+    }
+  }
+  if (i < 0) i = 0;
+  const a = keys[i];
+  // visible is step (held from this key until next)
+  if (i >= keys.length - 1) {
+    return { x: a.x, y: a.y, w: a.w, h: a.h, visible: a.visible };
+  }
+  const b = keys[i + 1];
+  const span = b.t - a.t;
+  const f = span > 1e-9 ? (t - a.t) / span : 0;
+  return {
+    x: a.x + (b.x - a.x) * f,
+    y: a.y + (b.y - a.y) * f,
+    w: a.w + (b.w - a.w) * f,
+    h: a.h + (b.h - a.h) * f,
+    visible: a.visible,
+  };
+}
+
+// Migrate a parsed project to current version in-place (v1 -> v2: add mosaics).
+export function migrateProject(proj: Project): Project {
+  for (const track of proj.tracks) {
+    for (const c of track.clips) {
+      if (!Array.isArray(c.mosaics)) c.mosaics = [];
+    }
+  }
+  proj.version = 2;
+  return proj;
+}
+
 export function newProject(name = "untitled"): Project {
   return {
-    version: 1,
+    version: 2,
     name,
     settings: { width: 1920, height: 1080, fps: 30, sampleRate: 48000 },
     media: [],
@@ -80,6 +155,10 @@ const UNDO_LIMIT = 100;
 export class Store {
   project: Project;
   selectedClipId: string | null = null;
+  // Gap selection is exclusive with clip selection.
+  selectedGap: GapSelection | null = null;
+  // Selected mosaic region id within the selected clip.
+  selectedRegionId: string | null = null;
   playhead = 0;
   pxPerSec = 100;
   scrollSec = 0;
@@ -146,6 +225,8 @@ export class Store {
     this.project = project;
     this.filePath = filePath;
     this.selectedClipId = null;
+    this.selectedGap = null;
+    this.selectedRegionId = null;
     this.playhead = 0;
     this.scrollSec = 0;
     this.undoStack = [];
@@ -163,7 +244,26 @@ export class Store {
   private sanitizeSelection(): void {
     if (this.selectedClipId && !this.findClip(this.selectedClipId)) {
       this.selectedClipId = null;
+      this.selectedRegionId = null;
     }
+    if (this.selectedGap) {
+      const t = this.project.tracks.find((tr) => tr.id === this.selectedGap!.trackId);
+      if (!t) this.selectedGap = null;
+    }
+  }
+
+  // Select a clip, clearing gap selection (exclusive).
+  selectClip(id: string | null): void {
+    this.selectedClipId = id;
+    this.selectedGap = null;
+    if (!id) this.selectedRegionId = null;
+  }
+
+  // Select a gap, clearing clip selection (exclusive). null clears both.
+  selectGap(gap: GapSelection | null): void {
+    this.selectedGap = gap;
+    this.selectedClipId = null;
+    this.selectedRegionId = null;
   }
 
   findClip(id: string): { track: Track; clip: Clip } | null {

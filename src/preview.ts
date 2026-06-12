@@ -1,6 +1,14 @@
-// Preview canvas: fit project resolution, rAF playback, layered drawImage with opacity.
+// Preview canvas: fit project resolution, rAF playback, layered drawImage with opacity,
+// mosaic effect rendering, and an overlay hook for the mosaic editing UI.
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { Store, Clip, clipLength } from "./state";
+import { Store, Clip, clipLength, regionRectAt } from "./state";
+
+export interface FitRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
 
 interface VideoEl {
   el: HTMLVideoElement;
@@ -25,6 +33,11 @@ export class Preview {
   private lastTs = 0;
   private rafId = 0;
   private onStateChange: (() => void) | null = null;
+  // Overlay drawn on top of the frame when paused (mosaic editing UI).
+  private overlayDraw: ((ctx: CanvasRenderingContext2D, fit: FitRect) => void) | null = null;
+  // Offscreen canvas reused for the pixelate (mosaic) effect.
+  private mosaicCanvas = document.createElement("canvas");
+  private lastFit: FitRect = { x: 0, y: 0, w: 0, h: 0 };
 
   constructor(canvas: HTMLCanvasElement, store: Store, hiddenHost: HTMLElement) {
     this.canvas = canvas;
@@ -47,6 +60,21 @@ export class Preview {
 
   setOnStateChange(fn: () => void): void {
     this.onStateChange = fn;
+  }
+
+  // Hook for the mosaic editing overlay (frames/handles). Drawn on top when paused.
+  setOverlayDraw(fn: ((ctx: CanvasRenderingContext2D, fit: FitRect) => void) | null): void {
+    this.overlayDraw = fn;
+  }
+
+  // Current project-frame rect (CSS px) used by the overlay UI for hit-testing.
+  getFitRect(): FitRect {
+    return this.lastFit;
+  }
+
+  // Force a paused re-render (used by mosaic UI during editing).
+  requestRender(): void {
+    if (!this.playing) this.renderFrame();
   }
 
   isPlaying(): boolean {
@@ -208,6 +236,7 @@ export class Preview {
     ctx.fillRect(0, 0, cw, ch);
 
     const fit = this.fitRect();
+    this.lastFit = fit;
     ctx.fillStyle = "#000";
     ctx.fillRect(fit.x, fit.y, fit.w, fit.h);
 
@@ -230,8 +259,52 @@ export class Preview {
           this.drawFitted(v.el, v.el.videoWidth, v.el.videoHeight, fit);
         }
       }
+      ctx.globalAlpha = 1;
+      this.applyMosaics(a.clip, fit);
     }
     ctx.globalAlpha = 1;
+
+    // editing overlay only when paused
+    if (!this.playing && this.overlayDraw) this.overlayDraw(ctx, fit);
+  }
+
+  // Apply enabled mosaic regions of a clip at the current playhead (pixelate effect).
+  private applyMosaics(clip: Clip, fit: FitRect): void {
+    if (!clip.mosaics || clip.mosaics.length === 0) return;
+    const t = this.store.playhead - clip.start; // τ relative to clip timeline start
+    const ctx = this.ctx;
+    const pw = this.store.project.settings.width || 1920;
+    const previewScale = fit.w / pw; // preview px per project px
+    for (const region of clip.mosaics) {
+      if (!region.enabled) continue;
+      const r = regionRectAt(region, t);
+      if (!r || !r.visible) continue;
+      const rx = fit.x + r.x * fit.w;
+      const ry = fit.y + r.y * fit.h;
+      const rw = r.w * fit.w;
+      const rh = r.h * fit.h;
+      if (rw < 1 || rh < 1) continue;
+      // block size scaled to preview; strength is project px.
+      const block = Math.max(1, region.strength * previewScale);
+      const sw = Math.max(1, Math.round(rw / block));
+      const sh = Math.max(1, Math.round(rh / block));
+      const off = this.mosaicCanvas;
+      if (off.width !== sw || off.height !== sh) {
+        off.width = sw;
+        off.height = sh;
+      }
+      const octx = off.getContext("2d");
+      if (!octx) continue;
+      octx.clearRect(0, 0, sw, sh);
+      octx.imageSmoothingEnabled = true;
+      // downscale region into offscreen (source coords are device px on this.canvas)
+      const dpr = (this.canvas.width / (this.canvas.clientWidth || 1)) || 1;
+      octx.drawImage(this.canvas, rx * dpr, ry * dpr, rw * dpr, rh * dpr, 0, 0, sw, sh);
+      // upscale back without smoothing
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(off, 0, 0, sw, sh, rx, ry, rw, rh);
+      ctx.imageSmoothingEnabled = true;
+    }
   }
 
   // Draw source fitted (contain) into the project frame rect.

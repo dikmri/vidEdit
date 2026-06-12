@@ -1,6 +1,6 @@
 [package]
 name = "videdit"
-version = "0.1.0"
+version = "0.2.0"
 description = "A lightweight video editor"
 authors = ["dikmri"]
 edition = "2021"
@@ -20,6 +20,13 @@ tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+# Pure-Rust ONNX inference for auto-mosaic detection (no native deps, CI-safe on 3 OSes).
+tract-onnx = "0.21"
+# Must match tract-onnx's prost (ONNX proto surgery in detect.rs::sanitize_onnx)
+prost = "0.11"
+# Blocking HTTP for one-shot model download. default-features off keeps OpenSSL out;
+# the "tls" feature pulls rustls (already in the tree via tauri).
+ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [profile.release]
 opt-level = "s"

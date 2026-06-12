@@ -1,5 +1,5 @@
 // Canvas timeline: ruler, track headers, clips, playhead, drag-move, trim, zoom, snap.
-import { Store, Clip, Track, clipLength, uid } from "./state";
+import { Store, Clip, Track, Media, clipLength, uid } from "./state";
 
 const HEADER_W = 110; // track header width
 const RULER_H = 26;
@@ -49,6 +49,8 @@ export class Timeline {
     origTrackId: "",
   };
   private hoverCursor = "default";
+  // Drop highlight for OS DnD / custom media drag (track index + start sec), or null.
+  private dropHint: { trackIndex: number; sec: number } | null = null;
 
   constructor(canvas: HTMLCanvasElement, store: Store) {
     this.canvas = canvas;
@@ -117,6 +119,9 @@ export class Timeline {
     for (let i = 0; i < tracks.length; i++) {
       this.drawTrackClips(ctx, tracks[i], i, w);
     }
+
+    this.drawGapSelection(ctx, w);
+    this.drawDropHint(ctx);
 
     // track headers (drawn over lanes for left column)
     ctx.fillStyle = "#161616";
@@ -209,6 +214,61 @@ export class Timeline {
     }
   }
 
+  private drawGapSelection(ctx: CanvasRenderingContext2D, w: number): void {
+    const gap = this.store.selectedGap;
+    if (!gap) return;
+    const idx = this.store.project.tracks.findIndex((t) => t.id === gap.trackId);
+    if (idx < 0) return;
+    const top = this.trackTop(idx);
+    let x0 = this.secToX(gap.start);
+    const x1 = this.secToX(gap.end);
+    if (x1 < HEADER_W || x0 > w) return;
+    x0 = Math.max(x0, HEADER_W);
+    const gx = x0;
+    const gw = Math.max(2, x1 - x0);
+    const gy = top + 4;
+    const gh = TRACK_H - 8;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(gx, gy, gw, gh);
+    ctx.clip();
+    ctx.fillStyle = "rgba(124, 92, 255, 0.12)";
+    ctx.fillRect(gx, gy, gw, gh);
+    // diagonal hatch
+    ctx.strokeStyle = "rgba(160, 140, 255, 0.55)";
+    ctx.lineWidth = 1;
+    const stepPx = 8;
+    ctx.beginPath();
+    for (let px = gx - gh; px < gx + gw; px += stepPx) {
+      ctx.moveTo(px, gy + gh);
+      ctx.lineTo(px + gh, gy);
+    }
+    ctx.stroke();
+    ctx.restore();
+    ctx.strokeStyle = "rgba(124, 92, 255, 0.8)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(gx + 0.5, gy + 0.5, gw - 1, gh - 1);
+  }
+
+  private drawDropHint(ctx: CanvasRenderingContext2D): void {
+    const hint = this.dropHint;
+    if (!hint) return;
+    if (hint.trackIndex < 0 || hint.trackIndex >= this.store.project.tracks.length) return;
+    const top = this.trackTop(hint.trackIndex);
+    const x = this.secToX(hint.sec);
+    ctx.save();
+    ctx.fillStyle = "rgba(124, 92, 255, 0.18)";
+    ctx.fillRect(HEADER_W, top, this.cssSize().w - HEADER_W, TRACK_H);
+    ctx.strokeStyle = "#7c5cff";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(Math.max(x, HEADER_W), top + 2);
+    ctx.lineTo(Math.max(x, HEADER_W), top + TRACK_H - 2);
+    ctx.stroke();
+    ctx.restore();
+    ctx.lineWidth = 1;
+  }
+
   private drawPlayhead(ctx: CanvasRenderingContext2D, h: number): void {
     const x = this.secToX(this.store.playhead);
     if (x < HEADER_W) return;
@@ -241,6 +301,25 @@ export class Timeline {
       if (x >= cx && x <= cx + cw) return { track, clip: c, index: idx };
     }
     return null;
+  }
+
+  // Gap at empty position: span from prev clip end (or 0) to the next clip start.
+  // Returns null when there is no clip to the right (unselectable trailing space).
+  private gapAt(trackIndex: number, sec: number): { trackId: string; start: number; end: number } | null {
+    const track = this.store.project.tracks[trackIndex];
+    if (!track) return null;
+    const sorted = [...track.clips].sort((a, b) => a.start - b.start);
+    let prevEnd = 0;
+    for (const c of sorted) {
+      const cs = c.start;
+      const ce = c.start + clipLength(c);
+      if (sec >= cs && sec < ce) return null; // inside a clip
+      if (sec < cs) {
+        return { trackId: track.id, start: prevEnd, end: cs };
+      }
+      prevEnd = Math.max(prevEnd, ce);
+    }
+    return null; // no clip to the right
   }
 
   private edgeAt(clip: Clip, x: number): "l" | "r" | null {
@@ -318,7 +397,7 @@ export class Timeline {
 
     const hit = this.hitClip(x, y);
     if (hit) {
-      this.store.selectedClipId = hit.clip.id;
+      this.store.selectClip(hit.clip.id);
       const edge = this.edgeAt(hit.clip, x);
       this.drag.clipId = hit.clip.id;
       this.drag.origStart = hit.clip.start;
@@ -333,8 +412,11 @@ export class Timeline {
       }
       this.store.notify();
     } else {
-      // empty area: seek + deselect
-      this.store.selectedClipId = null;
+      // empty area: gap selection (if a clip is to the right) + seek
+      const idx = this.trackAtY(y);
+      const sec = this.xToSec(x);
+      const gap = idx >= 0 ? this.gapAt(idx, sec) : null;
+      this.store.selectGap(gap);
       this.drag.mode = "seek";
       this.seekTo(x);
     }
@@ -539,6 +621,12 @@ export class Timeline {
       const f = this.store.findClip(sel);
       if (!f) return;
       const orig = f.clip;
+      const splitOffset = p - orig.start; // τ shift for the right half
+      const rightMosaics = orig.mosaics.map((m) => ({
+        ...m,
+        id: uid("mz"),
+        keys: m.keys.map((k) => ({ ...k, t: k.t - splitOffset })),
+      }));
       const right: Clip = {
         id: uid("c"),
         mediaId: orig.mediaId,
@@ -547,14 +635,20 @@ export class Timeline {
         out: orig.out,
         volume: orig.volume,
         opacity: orig.opacity,
+        mosaics: rightMosaics,
       };
       orig.out = splitIn;
       f.track.clips.push(right);
-      this.store.selectedClipId = right.id;
+      this.store.selectClip(right.id);
     });
   }
 
+  // Delete selected clip, or ripple-delete the selected gap.
   deleteSelected(): void {
+    if (this.store.selectedGap) {
+      this.rippleDeleteGap();
+      return;
+    }
     const sel = this.store.selectedClipId;
     if (!sel) return;
     const found = this.store.findClip(sel);
@@ -563,8 +657,83 @@ export class Timeline {
       const f = this.store.findClip(sel);
       if (!f) return;
       f.track.clips = f.track.clips.filter((c) => c.id !== sel);
-      this.store.selectedClipId = null;
+      this.store.selectClip(null);
     });
+  }
+
+  // Ripple delete: remove gap span, shift clips at/after gap.end left by its width.
+  private rippleDeleteGap(): void {
+    const gap = this.store.selectedGap;
+    if (!gap) return;
+    const amount = gap.end - gap.start;
+    if (amount <= 0) return;
+    const eps = 1e-6;
+    this.store.commit(() => {
+      const track = this.store.project.tracks.find((t) => t.id === gap.trackId);
+      if (!track) return;
+      for (const c of track.clips) {
+        if (c.start >= gap.end - eps) c.start -= amount;
+      }
+      this.store.selectGap(null);
+    });
+  }
+
+  // ---- external drop (OS DnD / media-bin custom drag) ----
+
+  // Map a client position to a track index + start sec (snapped, clamped >= 0).
+  resolveDrop(clientX: number, clientY: number, kind: "video" | "audio"): { trackIndex: number; sec: number } | null {
+    const r = this.canvas.getBoundingClientRect();
+    if (clientX < r.left || clientX > r.right || clientY < r.top || clientY > r.bottom) return null;
+    const x = clientX - r.left;
+    const y = clientY - r.top;
+    if (x < HEADER_W) return null;
+    let sec = Math.max(0, this.xToSec(x));
+    sec = this.snapSec(sec, null);
+    sec = Math.max(0, sec);
+    const idxAt = this.trackAtY(y);
+    let trackIndex = -1;
+    if (idxAt >= 0 && this.store.project.tracks[idxAt].kind === kind) {
+      trackIndex = idxAt;
+    } else {
+      trackIndex = this.store.project.tracks.findIndex((t) => t.kind === kind);
+    }
+    if (trackIndex < 0) return null;
+    return { trackIndex, sec };
+  }
+
+  // Show / clear the drop highlight during a drag.
+  setDropHint(hint: { trackIndex: number; sec: number } | null): void {
+    const same =
+      (hint === null && this.dropHint === null) ||
+      (hint !== null &&
+        this.dropHint !== null &&
+        hint.trackIndex === this.dropHint.trackIndex &&
+        Math.abs(hint.sec - this.dropHint.sec) < 1e-6);
+    this.dropHint = hint;
+    if (!same) this.render();
+  }
+
+  // Place media as a clip at a track/sec, avoiding overlaps (commit). Returns true on success.
+  placeMedia(media: Media, makeClip: (m: Media, start: number) => Clip, trackIndex: number, sec: number): boolean {
+    const track = this.store.project.tracks[trackIndex];
+    if (!track) return false;
+    const wantKind = media.kind === "audio" ? "audio" : "video";
+    if (track.kind !== wantKind) return false;
+    const clip = makeClip(media, sec);
+    const len = clipLength(clip);
+    let start = sec;
+    const sorted = [...track.clips].sort((a, b) => a.start - b.start);
+    for (const c of sorted) {
+      const cs = c.start;
+      const ce = c.start + clipLength(c);
+      if (start < ce && start + len > cs) start = ce;
+    }
+    clip.start = start;
+    this.store.commit(() => {
+      track.clips.push(clip);
+      this.store.selectClip(clip.id);
+    });
+    return true;
   }
 
   zoom(factor: number): void {

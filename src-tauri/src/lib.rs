@@ -1,8 +1,10 @@
+mod detect;
 mod export;
 mod ffmpeg;
 mod media;
 mod project;
 
+use detect::AutoMosaicState;
 use export::ExportState;
 use serde::Serialize;
 use std::sync::Arc;
@@ -71,12 +73,14 @@ fn cancel_export(state: State<'_, Arc<ExportState>>) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let export_state = Arc::new(ExportState::new());
+    let automosaic_state = Arc::new(AutoMosaicState::new());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(export_state)
+        .manage(automosaic_state)
         .invoke_handler(tauri::generate_handler![
             check_ffmpeg,
             probe_media,
@@ -85,6 +89,8 @@ pub fn run() {
             load_project,
             export_video,
             cancel_export,
+            detect::auto_mosaic,
+            detect::cancel_auto_mosaic,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -36,6 +36,31 @@ struct Clip {
     out: f64,
     volume: f64,
     opacity: f64,
+    #[serde(default)]
+    mosaics: Vec<MosaicRegion>,
+}
+
+// --- Mosaic data model (shared with detect.rs) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MosaicKey {
+    pub t: f64,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    #[serde(default)]
+    pub visible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MosaicRegion {
+    pub id: String,
+    pub strength: f64,
+    pub enabled: bool,
+    pub keys: Vec<MosaicKey>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +138,178 @@ pub struct InputSpec {
     pub loop_dur: Option<f64>,
 }
 
+// Round up to an even integer, with a minimum.
+fn even_ceil(v: f64, min: u32) -> u32 {
+    let mut n = v.ceil() as i64;
+    if n < min as i64 {
+        n = min as i64;
+    }
+    if n % 2 != 0 {
+        n += 1;
+    }
+    n as u32
+}
+
+// Format an f64 as a compact ffmpeg-expr literal (no scientific notation).
+fn lit(v: f64) -> String {
+    let s = format!("{:.4}", v);
+    // trim trailing zeros but keep at least one digit after the point
+    let s = s.trim_end_matches('0');
+    let s = s.trim_end_matches('.');
+    if s.is_empty() || s == "-" {
+        "0".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+// Build the piecewise-linear interpolation expression for one coordinate
+// accessor over the keys, clamped to [0, max]. `pick` returns the pixel value
+// of a key. Times are the chain-internal time tau (setpts=PTS-STARTPTS done).
+fn coord_expr(keys: &[MosaicKey], pick: impl Fn(&MosaicKey) -> f64, clamp_max: f64) -> String {
+    // Keys are assumed sorted ascending by t. Before first key the region is
+    // not visible (VIS handles that), but we still need a defined value; hold
+    // the first key's value. After last key, hold the last value.
+    if keys.is_empty() {
+        return "0".to_string();
+    }
+    if keys.len() == 1 {
+        return format!("clip({},0,{})", lit(pick(&keys[0])), lit(clamp_max));
+    }
+    // Build nested if() from the last segment outward.
+    let last = keys.len() - 1;
+    // Start with the value held after the last key.
+    let mut expr = lit(pick(&keys[last]));
+    // Iterate segments [i, i+1] from last down to first.
+    for i in (0..last).rev() {
+        let t0 = keys[i].t;
+        let t1 = keys[i + 1].t;
+        let v0 = pick(&keys[i]);
+        let v1 = pick(&keys[i + 1]);
+        let seg = if (t1 - t0).abs() < 1e-9 {
+            lit(v1)
+        } else {
+            let slope = (v1 - v0) / (t1 - t0);
+            // v0 + slope*(t - t0)
+            format!("({}+{}*(t-{}))", lit(v0), lit(slope), lit(t0))
+        };
+        expr = format!("if(lt(t,{}),{},{})", lit(t1), seg, expr);
+    }
+    format!("clip({},0,{})", expr, lit(clamp_max))
+}
+
+// Build the enable expression (sum of between() over visible step intervals).
+// Returns None if every interval is visible (enable can be omitted).
+fn vis_expr(keys: &[MosaicKey]) -> Option<String> {
+    if keys.is_empty() {
+        return Some("0".to_string());
+    }
+    // Each key's `visible` applies as a step from keys[i].t to keys[i+1].t,
+    // the last key extends to +inf.
+    let mut intervals: Vec<(f64, f64)> = Vec::new();
+    for i in 0..keys.len() {
+        let a = keys[i].t;
+        let b = if i + 1 < keys.len() {
+            keys[i + 1].t
+        } else {
+            f64::INFINITY
+        };
+        if keys[i].visible {
+            intervals.push((a, b));
+        }
+    }
+    if intervals.is_empty() {
+        return Some("0".to_string());
+    }
+    // Merge adjacent/contiguous visible intervals.
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for (a, b) in intervals {
+        if let Some(last) = merged.last_mut() {
+            if (a - last.1).abs() < 1e-9 {
+                last.1 = b;
+                continue;
+            }
+        }
+        merged.push((a, b));
+    }
+    let intervals = merged;
+    let terms: Vec<String> = intervals
+        .iter()
+        .map(|(a, b)| {
+            if b.is_infinite() {
+                format!("gte(t,{})", lit(*a))
+            } else {
+                format!("between(t,{},{})", lit(*a), lit(*b))
+            }
+        })
+        .collect();
+    Some(terms.join("+"))
+}
+
+// Build the per-clip mosaic filter stages. Inserted between the `fps={fps}`
+// stage and `format=yuva420p`. `in_label` is the input pad label (without
+// brackets), e.g. "m0i"; returns (filter_segment, out_label) where out_label
+// is also without brackets. If no enabled region produces stages, returns an
+// empty segment and the input label unchanged.
+fn build_mosaic_chain(
+    in_label: &str,
+    clip_idx: usize,
+    mosaics: &[MosaicRegion],
+    w: u32,
+    h: u32,
+) -> (String, String) {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = in_label.to_string();
+    let mut stage = 0usize;
+
+    for region in mosaics {
+        if !region.enabled || region.keys.is_empty() {
+            continue;
+        }
+        // crop size = max w/h over keys, in px, even-ceil, min 16.
+        let max_w = region.keys.iter().map(|k| k.w).fold(0.0_f64, f64::max);
+        let max_h = region.keys.iter().map(|k| k.h).fold(0.0_f64, f64::max);
+        let wr = even_ceil(max_w * w as f64, 16);
+        let hr = even_ceil(max_h * h as f64, 16);
+
+        // P = clamp(strength, 4, min(Wr,Hr)/2)
+        let p_max = (wr.min(hr) as f64 / 2.0).floor().max(4.0);
+        let p = region.strength.max(4.0).min(p_max).round() as u32;
+
+        // Position expressions: top-left = (x*W, y*H), clamped to [0, W-Wr]/[0, H-Hr].
+        let xmax = (w as f64 - wr as f64).max(0.0);
+        let ymax = (h as f64 - hr as f64).max(0.0);
+        let xexpr = coord_expr(&region.keys, |k| k.x * w as f64, xmax);
+        let yexpr = coord_expr(&region.keys, |k| k.y * h as f64, ymax);
+        let vis = vis_expr(&region.keys);
+
+        let base = format!("c{}s{}", clip_idx, stage);
+        let lb = format!("{}b", base);
+        let lt = format!("{}t", base);
+        let lm = format!("{}m", base);
+        let lout = format!("{}o", base);
+
+        parts.push(format!("[{}]split=2[{}][{}]", cur, lb, lt));
+        parts.push(format!(
+            "[{}]crop=w={}:h={}:x='{}':y='{}',pixelize=width={}:height={}[{}]",
+            lt, wr, hr, xexpr, yexpr, p, p, lm
+        ));
+        let enable = match &vis {
+            Some(v) => format!(":enable='{}'", v),
+            None => String::new(),
+        };
+        parts.push(format!(
+            "[{}][{}]overlay=x='{}':y='{}'{}[{}]",
+            lb, lm, xexpr, yexpr, enable, lout
+        ));
+
+        cur = lout;
+        stage += 1;
+    }
+
+    (parts.join(";\n"), cur)
+}
+
 fn build_filter_complex(project: &Project) -> (String, Vec<InputSpec>) {
     let s = &project.settings;
     let w = s.width;
@@ -176,16 +373,26 @@ fn build_filter_complex(project: &Project) -> (String, Vec<InputSpec>) {
         let input_idx = inputs.len();
         video_clip_input_idx.push(input_idx);
 
+        let v_label = format!("v{}", video_clip_idx);
+        // Pre-mosaic chain ends at fps={fps}; mosaic stages (if any) are inserted
+        // here, then the chain continues with format=yuva420p,...,setpts=PTS+start.
+        let pre_label = format!("m{}i", video_clip_idx);
+        let (mosaic_seg, post_label) =
+            build_mosaic_chain(&pre_label, video_clip_idx, &clip.mosaics, w, h);
+        let post_chain = format!(
+            "format=yuva420p,colorchannelmixer=aa={},setpts=PTS+{}/TB[{}]",
+            clip.opacity, clip.start, v_label
+        );
+
         if *is_image {
             inputs.push(InputSpec {
                 arg: media.path.clone(),
                 lavfi: false,
                 loop_dur: Some(clip.out - clip.clip_in),
             });
-            let v_label = format!("v{}", video_clip_idx);
             filter_parts.push(format!(
-                "[{}:v]scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={},format=yuva420p,colorchannelmixer=aa={},setpts=PTS+{}/TB[{}]",
-                input_idx, w, h, w, h, fps, clip.opacity, clip.start, v_label
+                "[{}:v]scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={}[{}]",
+                input_idx, w, h, w, h, fps, pre_label
             ));
         } else {
             inputs.push(InputSpec {
@@ -193,12 +400,15 @@ fn build_filter_complex(project: &Project) -> (String, Vec<InputSpec>) {
                 lavfi: false,
                 loop_dur: None,
             });
-            let v_label = format!("v{}", video_clip_idx);
             filter_parts.push(format!(
-                "[{}:v]trim=start={}:end={},setpts=PTS-STARTPTS,scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={},format=yuva420p,colorchannelmixer=aa={},setpts=PTS+{}/TB[{}]",
-                input_idx, clip.clip_in, clip.out, w, h, w, h, fps, clip.opacity, clip.start, v_label
+                "[{}:v]trim=start={}:end={},setpts=PTS-STARTPTS,scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={}[{}]",
+                input_idx, clip.clip_in, clip.out, w, h, w, h, fps, pre_label
             ));
         }
+        if !mosaic_seg.is_empty() {
+            filter_parts.push(mosaic_seg);
+        }
+        filter_parts.push(format!("[{}]{}", post_label, post_chain));
 
         // overlay without an enable window would show the first frame before
         // the clip starts (framesync extends it backwards)
@@ -512,5 +722,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn mosaic_fixture() -> Project {
+        // Project 1000x1000 so that normalized coords map to clean pixel values.
+        let json = r#"{
+            "version": 2,
+            "settings": { "width": 1000, "height": 1000, "fps": 30, "sampleRate": 48000 },
+            "media": [
+                { "id": "m1", "path": "a.mp4", "kind": "video", "duration": 10.0, "hasAudio": true }
+            ],
+            "tracks": [
+                { "id": "t1", "kind": "video", "name": "V1", "clips": [
+                    { "id": "c1", "mediaId": "m1", "start": 0.0, "in": 0.5, "out": 3.5, "volume": 1.0, "opacity": 1.0,
+                      "mosaics": [
+                        { "id": "auto-0", "strength": 20, "enabled": true, "keys": [
+                          { "t": 0.0, "x": 0.1, "y": 0.2, "w": 0.2, "h": 0.2, "visible": true },
+                          { "t": 1.0, "x": 0.3, "y": 0.2, "w": 0.2, "h": 0.2, "visible": true },
+                          { "t": 2.0, "x": 0.3, "y": 0.2, "w": 0.2, "h": 0.2, "visible": false }
+                        ] },
+                        { "id": "auto-1", "strength": 30, "enabled": false, "keys": [
+                          { "t": 0.0, "x": 0.5, "y": 0.5, "w": 0.1, "h": 0.1, "visible": true }
+                        ] }
+                      ]
+                    }
+                ]}
+            ]
+        }"#;
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn mosaic_filter_structure() {
+        let project = mosaic_fixture();
+        let (script, inputs) = build_filter_complex(&project);
+        println!("--- MOSAIC SCRIPT ---\n{}", script);
+
+        // No input stream is consumed more than once.
+        for idx in 0..inputs.len() {
+            for kind in ["v", "a"] {
+                let label = format!("[{}:{}]", idx, kind);
+                assert!(
+                    script.matches(&label).count() <= 1,
+                    "input stream {} consumed more than once",
+                    label
+                );
+            }
+        }
+
+        assert!(script.contains("[vout]"));
+        assert!(script.contains("[aout]"));
+
+        // Mosaic stages present (enabled region only).
+        assert!(script.contains("split=2"));
+        assert!(script.contains("crop=w="));
+        assert!(script.contains("pixelize=width="));
+        assert!(script.contains("overlay=x="));
+
+        // Disabled region (auto-1) must not emit any stage. With one enabled
+        // region we get exactly one split.
+        assert_eq!(script.matches("split=2").count(), 1);
+
+        // Crop size: max w/h = 0.2 * 1000 = 200 (already even, >=16).
+        assert!(
+            script.contains("crop=w=200:h=200:"),
+            "expected crop size 200x200"
+        );
+
+        // X interpolation domain: first segment t in [0,1], x goes 0.1->0.3
+        // i.e. 100px -> 300px. The expr nests if(lt(t,1),...) and the later
+        // segment if(lt(t,2),...). Verify tau-domain numbers are embedded.
+        assert!(script.contains("if(lt(t,1)"), "missing first segment guard");
+        assert!(script.contains("if(lt(t,2)"), "missing second segment guard");
+        // Slope of first x segment = (300-100)/(1-0) = 200, base 100.
+        assert!(script.contains("100+200*(t-0)"), "missing x lerp expression");
+        // Clamp to [0, W-Wr] = [0, 800].
+        assert!(script.contains("clip("), "missing clamp");
+        assert!(script.contains(",0,800)"), "missing x clamp bound 800");
+
+        // VIS: visible for [0,2), not visible after t=2 -> enable present.
+        assert!(script.contains("enable='between(t,0,2)"), "missing vis window");
+
+        // pixelize P = clamp(20,4,100) = 20.
+        assert!(script.contains("pixelize=width=20:height=20"), "wrong P");
     }
 }
