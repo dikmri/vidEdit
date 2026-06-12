@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>vidEdit</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header id="header">
+        <div class="header-left">
+          <span class="logo">vidEdit</span>
+          <button id="btn-new" class="btn">新規</button>
+          <button id="btn-open" class="btn">開く</button>
+          <button id="btn-save" class="btn">保存</button>
+          <button id="btn-saveas" class="btn">別名保存</button>
+          <span class="sep"></span>
+          <button id="btn-undo" class="btn" title="元に戻す (Ctrl+Z)">↶</button>
+          <button id="btn-redo" class="btn" title="やり直し (Ctrl+Y)">↷</button>
+        </div>
+        <div class="header-right">
+          <span id="project-name" class="project-name">untitled</span>
+        </div>
+      </header>
+
+      <div id="notice-bar"></div>
+
+      <main id="main-grid">
+        <section id="mediabin-panel" class="panel">
+          <div class="panel-head">
+            <span>メディアビン</span>
+            <button id="btn-add-media" class="btn btn-accent">+ メディア</button>
+          </div>
+          <div id="media-list" class="media-list"></div>
+        </section>
+
+        <section id="preview-panel" class="panel">
+          <div class="preview-wrap">
+            <canvas id="preview-canvas"></canvas>
+          </div>
+          <div class="transport">
+            <button id="btn-play" class="btn">▶</button>
+          </div>
+        </section>
+
+        <section id="timeline-panel" class="panel">
+          <div id="toolbar">
+            <button id="btn-split" class="btn" title="分割 (S)">分割</button>
+            <button id="btn-delete" class="btn" title="削除 (Delete)">削除</button>
+            <span class="sep"></span>
+            <button id="btn-zoom-out" class="btn" title="縮小">－</button>
+            <button id="btn-zoom-in" class="btn" title="拡大">＋</button>
+            <span class="sep"></span>
+            <button id="btn-add-v" class="btn">+V トラック</button>
+            <button id="btn-add-a" class="btn">+A トラック</button>
+            <span class="spacer"></span>
+            <button id="btn-export" class="btn btn-accent">書き出し</button>
+          </div>
+          <div id="timeline-wrap">
+            <canvas id="timeline-canvas"></canvas>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="hidden-media" aria-hidden="true"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
