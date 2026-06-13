@@ -32,6 +32,7 @@ export interface MosaicKey {
   w: number;
   h: number;
   visible: boolean;
+  rot: number; // rotation in degrees (default 0)
 }
 
 export interface MosaicRegion {
@@ -90,6 +91,7 @@ export interface RegionRect {
   w: number;
   h: number;
   visible: boolean;
+  rot: number; // degrees
 }
 
 // Interpolate a region's rect at relative time τ. Returns null before first key.
@@ -107,11 +109,13 @@ export function regionRectAt(region: MosaicRegion, t: number): RegionRect | null
   }
   if (i < 0) i = 0;
   const a = keys[i];
+  const aRot = a.rot ?? 0;
   // visible is step (held from this key until next)
   if (i >= keys.length - 1) {
-    return { x: a.x, y: a.y, w: a.w, h: a.h, visible: a.visible };
+    return { x: a.x, y: a.y, w: a.w, h: a.h, visible: a.visible, rot: aRot };
   }
   const b = keys[i + 1];
+  const bRot = b.rot ?? 0;
   const span = b.t - a.t;
   const f = span > 1e-9 ? (t - a.t) / span : 0;
   return {
@@ -120,6 +124,7 @@ export function regionRectAt(region: MosaicRegion, t: number): RegionRect | null
     w: a.w + (b.w - a.w) * f,
     h: a.h + (b.h - a.h) * f,
     visible: a.visible,
+    rot: aRot + (bRot - aRot) * f,
   };
 }
 
@@ -128,6 +133,11 @@ export function migrateProject(proj: Project): Project {
   for (const track of proj.tracks) {
     for (const c of track.clips) {
       if (!Array.isArray(c.mosaics)) c.mosaics = [];
+      for (const m of c.mosaics) {
+        for (const k of m.keys) {
+          if (typeof k.rot !== "number") k.rot = 0; // back-compat default
+        }
+      }
     }
   }
   proj.version = 2;

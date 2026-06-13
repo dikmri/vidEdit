@@ -275,6 +275,7 @@ export class Preview {
     const ctx = this.ctx;
     const pw = this.store.project.settings.width || 1920;
     const previewScale = fit.w / pw; // preview px per project px
+    const dpr = (this.canvas.width / (this.canvas.clientWidth || 1)) || 1;
     for (const region of clip.mosaics) {
       if (!region.enabled) continue;
       const r = regionRectAt(region, t);
@@ -284,10 +285,43 @@ export class Preview {
       const rw = r.w * fit.w;
       const rh = r.h * fit.h;
       if (rw < 1 || rh < 1) continue;
-      // block size scaled to preview; strength is project px.
+      const rot = r.rot ?? 0;
       const block = Math.max(1, region.strength * previewScale);
-      const sw = Math.max(1, Math.round(rw / block));
-      const sh = Math.max(1, Math.round(rh / block));
+
+      if (Math.abs(rot) < 1e-6) {
+        // axis-aligned fast path
+        const sw = Math.max(1, Math.round(rw / block));
+        const sh = Math.max(1, Math.round(rh / block));
+        const off = this.mosaicCanvas;
+        if (off.width !== sw || off.height !== sh) {
+          off.width = sw;
+          off.height = sh;
+        }
+        const octx = off.getContext("2d");
+        if (!octx) continue;
+        octx.clearRect(0, 0, sw, sh);
+        octx.imageSmoothingEnabled = true;
+        octx.drawImage(this.canvas, rx * dpr, ry * dpr, rw * dpr, rh * dpr, 0, 0, sw, sh);
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(off, 0, 0, sw, sh, rx, ry, rw, rh);
+        ctx.imageSmoothingEnabled = true;
+        continue;
+      }
+
+      // rotated path: pixelize the axis-aligned bounding box, then draw it back
+      // clipped to the rotated rect (blocks stay axis-aligned, per design).
+      const rad = (rot * Math.PI) / 180;
+      const cx = rx + rw / 2;
+      const cy = ry + rh / 2;
+      const hw = (Math.abs(rw * Math.cos(rad)) + Math.abs(rh * Math.sin(rad))) / 2;
+      const hh = (Math.abs(rw * Math.sin(rad)) + Math.abs(rh * Math.cos(rad))) / 2;
+      const bx = cx - hw;
+      const by = cy - hh;
+      const bw = hw * 2;
+      const bh = hh * 2;
+      if (bw < 1 || bh < 1) continue;
+      const sw = Math.max(1, Math.round(bw / block));
+      const sh = Math.max(1, Math.round(bh / block));
       const off = this.mosaicCanvas;
       if (off.width !== sw || off.height !== sh) {
         off.width = sw;
@@ -297,13 +331,22 @@ export class Preview {
       if (!octx) continue;
       octx.clearRect(0, 0, sw, sh);
       octx.imageSmoothingEnabled = true;
-      // downscale region into offscreen (source coords are device px on this.canvas)
-      const dpr = (this.canvas.width / (this.canvas.clientWidth || 1)) || 1;
-      octx.drawImage(this.canvas, rx * dpr, ry * dpr, rw * dpr, rh * dpr, 0, 0, sw, sh);
-      // upscale back without smoothing
+      octx.drawImage(this.canvas, bx * dpr, by * dpr, bw * dpr, bh * dpr, 0, 0, sw, sh);
+
+      ctx.save();
+      // clip to the rotated rect
+      ctx.translate(cx, cy);
+      ctx.rotate(rad);
+      ctx.beginPath();
+      ctx.rect(-rw / 2, -rh / 2, rw, rh);
+      ctx.clip();
+      ctx.rotate(-rad);
+      ctx.translate(-cx, -cy);
+      // draw pixelized bounding box at its screen position
       ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(off, 0, 0, sw, sh, rx, ry, rw, rh);
+      ctx.drawImage(off, 0, 0, sw, sh, bx, by, bw, bh);
       ctx.imageSmoothingEnabled = true;
+      ctx.restore();
     }
   }
 

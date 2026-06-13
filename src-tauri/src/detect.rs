@@ -18,8 +18,14 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-const MODEL_URL: &str =
-    "https://github.com/notAI-tech/NudeNet/releases/download/v3.4-weights/640m.onnx";
+// Direct release-download URLs redirect unauthenticated clients to a GitHub
+// login page (HTML); the API asset endpoint with Accept: octet-stream works.
+const MODEL_RELEASE_API: &str =
+    "https://api.github.com/repos/notAI-tech/NudeNet/releases/tags/v3.4-weights";
+const MODEL_ASSET_API: &str = "https://api.github.com/repos/notAI-tech/NudeNet/releases/assets";
+const MODEL_ASSET_NAME: &str = "640m.onnx";
+const MODEL_ASSET_ID_FALLBACK: u64 = 176832019;
+const HTTP_UA: &str = "vidEdit (https://github.com/dikmri/vidEdit)";
 const MODEL_MIN_BYTES: u64 = 5 * 1024 * 1024;
 const INPUT: usize = 640;
 const FPS: f64 = 3.0;
@@ -83,6 +89,27 @@ fn model_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(dir.join("nudenet-640m.onnx"))
 }
 
+// Resolve the asset id via the release-tag API; fall back to the known id.
+fn resolve_model_asset_url() -> String {
+    let id = ureq::get(MODEL_RELEASE_API)
+        .set("User-Agent", HTTP_UA)
+        .set("Accept", "application/vnd.github+json")
+        .call()
+        .ok()
+        .and_then(|r| r.into_string().ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|j| {
+            j["assets"].as_array().and_then(|assets| {
+                assets
+                    .iter()
+                    .find(|a| a["name"].as_str() == Some(MODEL_ASSET_NAME))
+                    .and_then(|a| a["id"].as_u64())
+            })
+        })
+        .unwrap_or(MODEL_ASSET_ID_FALLBACK);
+    format!("{}/{}", MODEL_ASSET_API, id)
+}
+
 fn ensure_model(app: &AppHandle, cancel: &AtomicBool) -> Result<std::path::PathBuf, String> {
     let path = model_path(app)?;
     if path.exists() {
@@ -97,7 +124,9 @@ fn ensure_model(app: &AppHandle, cancel: &AtomicBool) -> Result<std::path::PathB
     }
 
     emit_progress(app, "download", 0.0);
-    let resp = ureq::get(MODEL_URL)
+    let resp = ureq::get(&resolve_model_asset_url())
+        .set("User-Agent", HTTP_UA)
+        .set("Accept", "application/octet-stream")
         .call()
         .map_err(|e| format!("model download failed: {}", e))?;
 
@@ -121,6 +150,17 @@ fn ensure_model(app: &AppHandle, cancel: &AtomicBool) -> Result<std::path::PathB
             .map_err(|e| format!("model read: {}", e))?;
         if n == 0 {
             break;
+        }
+        if downloaded == 0 {
+            let head = &buf[..n.min(16)];
+            if head.starts_with(b"<!DOCTYPE") || head.starts_with(b"<html") {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(
+                    "model download returned an HTML page instead of the model \
+                     (GitHub may be blocking the request)"
+                        .to_string(),
+                );
+            }
         }
         std::io::Write::write_all(&mut file, &buf[..n])
             .map_err(|e| format!("model write: {}", e))?;
@@ -553,6 +593,7 @@ fn track_to_region(tr: &Track, in_sec: f64, id: usize) -> Option<MosaicRegion> {
                 w,
                 h,
                 visible: true,
+                rot: 0.0,
             }
         })
         .collect();
@@ -574,6 +615,7 @@ fn track_to_region(tr: &Track, in_sec: f64, id: usize) -> Option<MosaicRegion> {
         w: last.w,
         h: last.h,
         visible: false,
+        rot: 0.0,
     });
 
     Some(MosaicRegion {

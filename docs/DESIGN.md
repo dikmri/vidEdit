@@ -92,6 +92,46 @@
 
 ---
 
+# v3 追加設計 (0.3.0)
+
+## F. モデルダウンロード修正
+
+GitHub の release 直リンクは未認証だとログインページ(HTML)へリダイレクトされるようになったため、**GitHub API のアセットエンドポイント**を使う:
+
+1. `GET https://api.github.com/repos/notAI-tech/NudeNet/releases/tags/v3.4-weights`(`User-Agent` 必須、`Accept: application/vnd.github+json`)→ assets から name=640m.onnx の id を解決。失敗時は既知 id `176832019` にフォールバック。
+2. `GET https://api.github.com/repos/notAI-tech/NudeNet/releases/assets/{id}`(`Accept: application/octet-stream`、`User-Agent` 付き)→ リダイレクト追従でバイナリ取得(検証済み: 未認証で 103,538,690 bytes)。
+3. 先頭チャンクが `<!DOCTYPE`/`<html` なら即エラー。既存の 5MB 下限ガード維持。
+
+## G. モザイク回転 (Q/E/R、wvmTool 準拠)
+
+### データモデル
+
+`MosaicKey` に `rot: f64`(度、デフォルト 0、serde default)を追加。線形補間。.vep version は 2 のまま(追加フィールドは後方互換)。
+
+### UI(フロント)
+
+- 選択領域に対して `Q`=反時計 5°、`E`=時計 5°、`R`=0° リセット。いずれも現在 τ の key に記録(なければ追加)= K/H と同じ流儀。
+- プレビュー: 枠線/ハンドルは回転して描画。ヒットテスト・移動・リサイズはマウス座標を領域中心まわりに逆回転してから既存ロジックへ。モザイク効果は「回転矩形でクリップした領域に、軸平行ブロックのピクセル化を適用」(Canvas2D: save→translate(中心)→rotate→rect クリップ→ピクセル化済みバウンディング矩形を描画→restore)。
+
+### エクスポート (export.rs)
+
+領域の全 key が rot=0 なら従来チェーン。回転がある場合:
+
+```
+[in]split=2[b][t];
+[t]format=yuva420p,crop=w={D}:h={D}:x='{CX}-{D/2}':y='{CY}-{D/2}',rotate=a='-({TH})':c=none[r];
+[r]crop=w={Wr}:h={Hr}:x={(D-Wr)/2}:y={(D-Hr)/2},pixelize=...[p];
+[p]rotate=a='{TH}':ow={D}:oh={D}:c=none[m];
+[b][m]overlay=x='{CX}-{D/2}':y='{CY}-{D/2}':enable='{VIS}'[out]
+```
+
+- D = even_ceil(hypot(Wr,Hr))(回転矩形のバウンディングボックスは任意角で D 以下: Wr|cosθ|+Hr|sinθ| ≤ hypot)。min(W,H) を超える場合はクランプ。
+- CX/CY = 領域**中心**の区分線形式を `clip(式, D/2, W-D/2)` でクランプ(crop と overlay で同一文字列にして位置整合を保証)。
+- TH = rot の区分線形式(**ラジアン**に変換した数値をリテラル埋め込み)。1段目は負号、2段目は正号。
+- c=none で回転外周を透明化し、overlay は alpha 合成で回転矩形のみモザイクが乗る。
+
+---
+
 # v1 基本設計 (0.1.0)
 
 軽量・高速なクロスプラットフォーム動画編集ソフト。Tauri 2 (Rust) + Vite/TypeScript(フレームワーク不使用、Canvas 描画)。

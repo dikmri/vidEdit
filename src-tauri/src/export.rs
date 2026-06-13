@@ -52,6 +52,9 @@ pub struct MosaicKey {
     pub h: f64,
     #[serde(default)]
     pub visible: bool,
+    /// Rotation in degrees, around the rect center.
+    #[serde(default)]
+    pub rot: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,7 +169,7 @@ fn lit(v: f64) -> String {
 // Build the piecewise-linear interpolation expression for one coordinate
 // accessor over the keys, clamped to [0, max]. `pick` returns the pixel value
 // of a key. Times are the chain-internal time tau (setpts=PTS-STARTPTS done).
-fn coord_expr(keys: &[MosaicKey], pick: impl Fn(&MosaicKey) -> f64, clamp_max: f64) -> String {
+fn piecewise_expr(keys: &[MosaicKey], pick: impl Fn(&MosaicKey) -> f64) -> String {
     // Keys are assumed sorted ascending by t. Before first key the region is
     // not visible (VIS handles that), but we still need a defined value; hold
     // the first key's value. After last key, hold the last value.
@@ -174,7 +177,7 @@ fn coord_expr(keys: &[MosaicKey], pick: impl Fn(&MosaicKey) -> f64, clamp_max: f
         return "0".to_string();
     }
     if keys.len() == 1 {
-        return format!("clip({},0,{})", lit(pick(&keys[0])), lit(clamp_max));
+        return lit(pick(&keys[0]));
     }
     // Build nested if() from the last segment outward.
     let last = keys.len() - 1;
@@ -195,7 +198,21 @@ fn coord_expr(keys: &[MosaicKey], pick: impl Fn(&MosaicKey) -> f64, clamp_max: f
         };
         expr = format!("if(lt(t,{}),{},{})", lit(t1), seg, expr);
     }
-    format!("clip({},0,{})", expr, lit(clamp_max))
+    expr
+}
+
+fn coord_expr(
+    keys: &[MosaicKey],
+    pick: impl Fn(&MosaicKey) -> f64,
+    clamp_min: f64,
+    clamp_max: f64,
+) -> String {
+    format!(
+        "clip({},{},{})",
+        piecewise_expr(keys, pick),
+        lit(clamp_min),
+        lit(clamp_max)
+    )
 }
 
 // Build the enable expression (sum of between() over visible step intervals).
@@ -272,16 +289,11 @@ fn build_mosaic_chain(
         let wr = even_ceil(max_w * w as f64, 16);
         let hr = even_ceil(max_h * h as f64, 16);
 
-        // P = clamp(strength, 4, min(Wr,Hr)/2)
-        let p_max = (wr.min(hr) as f64 / 2.0).floor().max(4.0);
-        let p = region.strength.max(4.0).min(p_max).round() as u32;
-
-        // Position expressions: top-left = (x*W, y*H), clamped to [0, W-Wr]/[0, H-Hr].
-        let xmax = (w as f64 - wr as f64).max(0.0);
-        let ymax = (h as f64 - hr as f64).max(0.0);
-        let xexpr = coord_expr(&region.keys, |k| k.x * w as f64, xmax);
-        let yexpr = coord_expr(&region.keys, |k| k.y * h as f64, ymax);
         let vis = vis_expr(&region.keys);
+        let enable = match &vis {
+            Some(v) => format!(":enable='{}'", v),
+            None => String::new(),
+        };
 
         let base = format!("c{}s{}", clip_idx, stage);
         let lb = format!("{}b", base);
@@ -290,18 +302,93 @@ fn build_mosaic_chain(
         let lout = format!("{}o", base);
 
         parts.push(format!("[{}]split=2[{}][{}]", cur, lb, lt));
-        parts.push(format!(
-            "[{}]crop=w={}:h={}:x='{}':y='{}',pixelize=width={}:height={}[{}]",
-            lt, wr, hr, xexpr, yexpr, p, p, lm
-        ));
-        let enable = match &vis {
-            Some(v) => format!(":enable='{}'", v),
-            None => String::new(),
-        };
-        parts.push(format!(
-            "[{}][{}]overlay=x='{}':y='{}'{}[{}]",
-            lb, lm, xexpr, yexpr, enable, lout
-        ));
+
+        let has_rot = region.keys.iter().any(|k| k.rot.abs() > 1e-6);
+        if !has_rot {
+            // P = clamp(strength, 4, min(Wr,Hr)/2)
+            let p_max = (wr.min(hr) as f64 / 2.0).floor().max(4.0);
+            let p = region.strength.max(4.0).min(p_max).round() as u32;
+
+            // Position expressions: top-left = (x*W, y*H), clamped to [0, W-Wr]/[0, H-Hr].
+            let xmax = (w as f64 - wr as f64).max(0.0);
+            let ymax = (h as f64 - hr as f64).max(0.0);
+            let xexpr = coord_expr(&region.keys, |k| k.x * w as f64, 0.0, xmax);
+            let yexpr = coord_expr(&region.keys, |k| k.y * h as f64, 0.0, ymax);
+
+            parts.push(format!(
+                "[{}]crop=w={}:h={}:x='{}':y='{}',pixelize=width={}:height={}[{}]",
+                lt, wr, hr, xexpr, yexpr, p, p, lm
+            ));
+            parts.push(format!(
+                "[{}][{}]overlay=x='{}':y='{}'{}[{}]",
+                lb, lm, xexpr, yexpr, enable, lout
+            ));
+        } else {
+            // Rotated mosaic: crop a DxD window around the (clamped) region
+            // center, rotate -theta so the rect is axis-aligned, crop+pixelize
+            // it, rotate back +theta with transparent fill, alpha-overlay.
+            // D = hypot bounds the rect's bbox for any angle
+            // (Wr|cos|+Hr|sin| <= hypot(Wr,Hr)).
+            let mut d = even_ceil(((wr as f64).powi(2) + (hr as f64).powi(2)).sqrt(), 16);
+            let frame_min = w.min(h) & !1u32;
+            if d > frame_min {
+                d = frame_min;
+            }
+            let wr = wr.min(d);
+            let hr = hr.min(d);
+            let p_max = (wr.min(hr) as f64 / 2.0).floor().max(4.0);
+            let p = region.strength.max(4.0).min(p_max).round() as u32;
+
+            let dh = d as f64 / 2.0;
+            // Identical strings in crop and overlay keep the patch aligned.
+            let cxe = format!(
+                "{}-{}",
+                coord_expr(
+                    &region.keys,
+                    |k| (k.x + k.w / 2.0) * w as f64,
+                    dh,
+                    w as f64 - dh
+                ),
+                lit(dh)
+            );
+            let cye = format!(
+                "{}-{}",
+                coord_expr(
+                    &region.keys,
+                    |k| (k.y + k.h / 2.0) * h as f64,
+                    dh,
+                    h as f64 - dh
+                ),
+                lit(dh)
+            );
+            let th = piecewise_expr(&region.keys, |k| k.rot.to_radians());
+            let lr = format!("{}r", base);
+            let lp = format!("{}p", base);
+
+            parts.push(format!(
+                "[{}]format=yuva420p,crop=w={}:h={}:x='{}':y='{}',rotate=a='-({})':c=none[{}]",
+                lt, d, d, cxe, cye, th, lr
+            ));
+            parts.push(format!(
+                "[{}]crop=w={}:h={}:x={}:y={},pixelize=width={}:height={}[{}]",
+                lr,
+                wr,
+                hr,
+                (d - wr) / 2,
+                (d - hr) / 2,
+                p,
+                p,
+                lp
+            ));
+            parts.push(format!(
+                "[{}]rotate=a='{}':ow={}:oh={}:c=none[{}]",
+                lp, th, d, d, lm
+            ));
+            parts.push(format!(
+                "[{}][{}]overlay=x='{}':y='{}'{}[{}]",
+                lb, lm, cxe, cye, enable, lout
+            ));
+        }
 
         cur = lout;
         stage += 1;
@@ -805,5 +892,51 @@ mod tests {
 
         // pixelize P = clamp(20,4,100) = 20.
         assert!(script.contains("pixelize=width=20:height=20"), "wrong P");
+    }
+
+    #[test]
+    fn mosaic_rotation_structure() {
+        let json = r#"{
+            "version": 2,
+            "settings": { "width": 1000, "height": 1000, "fps": 30, "sampleRate": 48000 },
+            "media": [
+                { "id": "m1", "path": "a.mp4", "kind": "video", "duration": 10.0, "hasAudio": false }
+            ],
+            "tracks": [
+                { "id": "t1", "kind": "video", "name": "V1", "clips": [
+                    { "id": "c1", "mediaId": "m1", "start": 0.0, "in": 0.5, "out": 3.5,
+                      "volume": 1.0, "opacity": 1.0,
+                      "mosaics": [
+                        { "id": "mz1", "strength": 20, "enabled": true, "keys": [
+                          { "t": 0.0, "x": 0.3, "y": 0.3, "w": 0.2, "h": 0.1, "visible": true, "rot": 0 },
+                          { "t": 2.0, "x": 0.3, "y": 0.3, "w": 0.2, "h": 0.1, "visible": true, "rot": 90 }
+                        ] }
+                      ]
+                    }
+                ]}
+            ]
+        }"#;
+        let project: Project = serde_json::from_str(json).unwrap();
+        let (script, _inputs) = build_filter_complex(&project);
+        println!("--- ROT SCRIPT ---\n{}", script);
+
+        // Rotation path: two rotate stages with transparent fill.
+        assert_eq!(script.matches("rotate=a=").count(), 2);
+        assert_eq!(script.matches(":c=none").count(), 2);
+        // D = even_ceil(hypot(200,100)) = 224, window crop present.
+        assert!(script.contains("crop=w=224:h=224:"), "missing DxD window crop");
+        // Inner axis-aligned crop of the rect at the window center.
+        assert!(script.contains("crop=w=200:h=100:x=12:y=62"), "missing inner crop");
+        // Center-x: (0.3+0.1)*1000 = 400, clamped to [112, 888], minus 112.
+        assert!(script.contains(",112,888)"), "missing center x clamp");
+        assert!(script.contains("-112"), "missing center x offset");
+        // Theta lerp 0 -> pi/2 over [0,2]: slope ~0.7854 rad/s.
+        assert!(script.contains("0.7854"), "missing radians lerp");
+        assert!(script.contains("pixelize=width=20:height=20"));
+        // Old key data without `rot` must keep working (serde default).
+        let legacy: MosaicKey =
+            serde_json::from_str(r#"{ "t":0,"x":0,"y":0,"w":0.1,"h":0.1,"visible":true }"#)
+                .unwrap();
+        assert_eq!(legacy.rot, 0.0);
     }
 }

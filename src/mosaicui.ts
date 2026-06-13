@@ -16,6 +16,16 @@ import { autoMosaic, cancelAutoMosaic } from "./ipc";
 
 const HANDLE_PX = 8;
 const MIN_NORM = 0.01; // minimum region size (normalized)
+const ROT_STEP = 5; // degrees per Q/E press
+
+// Rotate point (px,py) around (cx,cy) by angle a (radians).
+function rotatePt(px: number, py: number, cx: number, cy: number, a: number): { x: number; y: number } {
+  const c = Math.cos(a);
+  const s = Math.sin(a);
+  const dx = px - cx;
+  const dy = py - cy;
+  return { x: cx + dx * c - dy * s, y: cy + dx * s + dy * c };
+}
 
 type EditMode = "idle" | "draw" | "move" | "resize";
 type HandleId = "nw" | "ne" | "sw" | "se";
@@ -231,22 +241,30 @@ export class MosaicUI {
     const ry = fit.y + rr.y * fit.h;
     const rw = rr.w * fit.w;
     const rh = rr.h * fit.h;
+    const cx = rx + rw / 2;
+    const cy = ry + rh / 2;
+    const rad = ((rr.rot ?? 0) * Math.PI) / 180;
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(rad);
     ctx.strokeStyle = rr.visible ? "#7c5cff" : "#888";
     ctx.lineWidth = 1.5;
-    ctx.strokeRect(rx, ry, rw, rh);
-    // corner handles
+    ctx.strokeRect(-rw / 2, -rh / 2, rw, rh);
+    // corner handles (in rotated local space)
     ctx.fillStyle = "#7c5cff";
-    for (const [hx, hy] of this.cornerPts(rx, ry, rw, rh)) {
+    for (const [hx, hy] of this.cornerPtsLocal(rw, rh)) {
       ctx.fillRect(hx - HANDLE_PX / 2, hy - HANDLE_PX / 2, HANDLE_PX, HANDLE_PX);
     }
+    ctx.restore();
   }
 
-  private cornerPts(rx: number, ry: number, rw: number, rh: number): [number, number][] {
+  private cornerPtsLocal(rw: number, rh: number): [number, number][] {
     return [
-      [rx, ry],
-      [rx + rw, ry],
-      [rx, ry + rh],
-      [rx + rw, ry + rh],
+      [-rw / 2, -rh / 2],
+      [rw / 2, -rh / 2],
+      [-rw / 2, rh / 2],
+      [rw / 2, rh / 2],
     ];
   }
 
@@ -282,13 +300,19 @@ export class MosaicUI {
     if (region) {
       const rr = regionRectAt(region, c.tau);
       if (rr) {
-        const rx = fit.x + rr.x * fit.w;
-        const ry = fit.y + rr.y * fit.h;
         const rw = rr.w * fit.w;
         const rh = rr.h * fit.h;
-        const mx = e.clientX - this.canvas.getBoundingClientRect().left;
-        const my = e.clientY - this.canvas.getBoundingClientRect().top;
-        const h = this.hitHandle(mx, my, rx, ry, rw, rh);
+        const rect = this.canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+        // un-rotate mouse around region center, then test in axis-aligned local space
+        const ccx = fit.x + (rr.x + rr.w / 2) * fit.w;
+        const ccy = fit.y + (rr.y + rr.h / 2) * fit.h;
+        const rad = ((rr.rot ?? 0) * Math.PI) / 180;
+        const lm = rotatePt(mx, my, ccx, ccy, -rad);
+        const lrx = ccx - rw / 2;
+        const lry = ccy - rh / 2;
+        const h = this.hitHandle(lm.x, lm.y, lrx, lry, rw, rh);
         if (h) {
           this.mode = "resize";
           this.activeHandle = h;
@@ -296,9 +320,10 @@ export class MosaicUI {
           e.preventDefault();
           return;
         }
-        // hit body -> move
-        if (p.x >= rr.x && p.x <= rr.x + rr.w && p.y >= rr.y && p.y <= rr.y + rr.h) {
+        // hit body -> move (local-space containment)
+        if (lm.x >= lrx && lm.x <= lrx + rw && lm.y >= lry && lm.y <= lry + rh) {
           this.mode = "move";
+          // grab offset stored in normalized global space (move is a global translation)
           this.moveGrab = { dx: p.x - rr.x, dy: p.y - rr.y };
           this.keysSnapshot = JSON.stringify(region.keys);
           e.preventDefault();
@@ -308,7 +333,7 @@ export class MosaicUI {
     }
 
     // otherwise: select a region whose rect contains the point
-    const hit = this.regionAt(c.clip, c.tau, p.x, p.y);
+    const hit = this.regionAt(c.clip, c.tau, p.x, p.y, fit);
     if (hit) {
       this.store.selectedRegionId = hit.id;
       this.store.notify();
@@ -345,34 +370,43 @@ export class MosaicUI {
     let ny = rr.y;
     let nw = rr.w;
     let nh = rr.h;
+    const rot = rr.rot ?? 0;
 
     if (this.mode === "move") {
+      // global translation; rotation unchanged
       nx = clamp01(p.x - this.moveGrab.dx);
       ny = clamp01(p.y - this.moveGrab.dy);
       nx = Math.min(nx, 1 - nw);
       ny = Math.min(ny, 1 - nh);
     } else if (this.mode === "resize" && this.activeHandle) {
-      const left = rr.x;
-      const top = rr.y;
-      const right = rr.x + rr.w;
-      const bottom = rr.y + rr.h;
-      let l = left,
-        t = top,
-        r = right,
-        b = bottom;
-      const px = clamp01(p.x);
-      const py = clamp01(p.y);
-      if (this.activeHandle.includes("w")) l = px;
-      if (this.activeHandle.includes("e")) r = px;
-      if (this.activeHandle.includes("n")) t = py;
-      if (this.activeHandle.includes("s")) b = py;
-      nx = Math.min(l, r);
-      ny = Math.min(t, b);
-      nw = Math.max(MIN_NORM, Math.abs(r - l));
-      nh = Math.max(MIN_NORM, Math.abs(b - t));
+      // work in the region's rotated local frame (normalized units)
+      const cx = rr.x + rr.w / 2;
+      const cy = rr.y + rr.h / 2;
+      const rad = (rot * Math.PI) / 180;
+      // un-rotate the (clamped) mouse point into local space around center
+      const pc = clamp01p(p);
+      const lm = rotatePt(pc.x, pc.y, cx, cy, -rad);
+      let l = cx - rr.w / 2;
+      let t = cy - rr.h / 2;
+      let r = cx + rr.w / 2;
+      let b = cy + rr.h / 2;
+      if (this.activeHandle.includes("w")) l = lm.x;
+      if (this.activeHandle.includes("e")) r = lm.x;
+      if (this.activeHandle.includes("n")) t = lm.y;
+      if (this.activeHandle.includes("s")) b = lm.y;
+      const lw = Math.max(MIN_NORM, Math.abs(r - l));
+      const lh = Math.max(MIN_NORM, Math.abs(b - t));
+      // new local center, mapped back to global by rotating around old center
+      const lcx = (l + r) / 2;
+      const lcy = (t + b) / 2;
+      const gc = rotatePt(lcx, lcy, cx, cy, rad);
+      nw = lw;
+      nh = lh;
+      nx = gc.x - lw / 2;
+      ny = gc.y - lh / 2;
     }
     // live update of the current-τ key (no commit until mouseup)
-    this.writeKey(region, c.tau, { x: nx, y: ny, w: nw, h: nh, visible: rr.visible }, false);
+    this.writeKey(region, c.tau, { x: nx, y: ny, w: nw, h: nh, visible: rr.visible, rot }, false);
     this.preview.requestRender();
   }
 
@@ -391,7 +425,7 @@ export class MosaicUI {
           id: uid("mz"),
           strength: 20,
           enabled: true,
-          keys: [{ t: Math.max(0, c.tau), x: r.x, y: r.y, w: r.w, h: r.h, visible: true }],
+          keys: [{ t: Math.max(0, c.tau), x: r.x, y: r.y, w: r.w, h: r.h, visible: true, rot: 0 }],
         };
         this.store.commit(() => {
           c.clip.mosaics.push(region);
@@ -408,7 +442,7 @@ export class MosaicUI {
     if (region && c) {
       const rr = regionRectAt(region, c.tau);
       if (rr && this.keysSnapshot !== null) {
-        const final = { x: rr.x, y: rr.y, w: rr.w, h: rr.h, visible: rr.visible };
+        const final = { x: rr.x, y: rr.y, w: rr.w, h: rr.h, visible: rr.visible, rot: rr.rot ?? 0 };
         region.keys = JSON.parse(this.keysSnapshot); // revert so commit snapshots pre-edit
         this.store.commit(() => {
           this.writeKey(region, c.tau, final, true);
@@ -435,13 +469,22 @@ export class MosaicUI {
     }
   }
 
-  private regionAt(clip: Clip, tau: number, x: number, y: number): MosaicRegion | null {
-    // topmost (last) region containing the point
+  private regionAt(clip: Clip, tau: number, x: number, y: number, fit: FitRect): MosaicRegion | null {
+    // topmost (last) region containing the point (rotation-aware)
     for (let i = clip.mosaics.length - 1; i >= 0; i--) {
       const region = clip.mosaics[i];
       const rr = regionRectAt(region, tau);
       if (!rr) continue;
-      if (x >= rr.x && x <= rr.x + rr.w && y >= rr.y && y <= rr.y + rr.h) return region;
+      // un-rotate the point around the region center (work in pixel space for the rotation)
+      const cx = fit.x + (rr.x + rr.w / 2) * fit.w;
+      const cy = fit.y + (rr.y + rr.h / 2) * fit.h;
+      const px = fit.x + x * fit.w;
+      const py = fit.y + y * fit.h;
+      const rad = ((rr.rot ?? 0) * Math.PI) / 180;
+      const lm = rotatePt(px, py, cx, cy, -rad);
+      const lx = (lm.x - fit.x) / fit.w;
+      const ly = (lm.y - fit.y) / fit.h;
+      if (lx >= rr.x && lx <= rr.x + rr.w && ly >= rr.y && ly <= rr.y + rr.h) return region;
     }
     return null;
   }
@@ -462,27 +505,39 @@ export class MosaicUI {
   // ---- keyboard (called from main; returns true if handled) ----
 
   // K: add key at current τ from interpolated rect. H: add visibility-toggle key.
+  // Q/E: rotate -/+ 5°. R: reset rotation to 0. All record at current τ.
   handleKey(key: string): boolean {
-    if (key !== "k" && key !== "K" && key !== "h" && key !== "H") return false;
+    const k = key.toLowerCase();
+    if (k !== "k" && k !== "h" && k !== "q" && k !== "e" && k !== "r") return false;
     const c = this.ctx();
     if (!c || !c.inRange) return false;
     const region = this.selectedRegion();
     if (!region) return false;
     const rr = regionRectAt(region, c.tau);
-    if (key === "k" || key === "K") {
-      const base = rr || (region.keys.length ? region.keys[0] : null);
-      if (!base) return false;
+    const base = rr || (region.keys.length ? region.keys[0] : null);
+    if (!base) return false;
+    const baseRot = (base as { rot?: number }).rot ?? 0;
+
+    if (k === "k") {
       this.store.commit(() => {
-        this.writeKey(region, c.tau, { x: base.x, y: base.y, w: base.w, h: base.h, visible: base.visible }, true);
+        this.writeKey(region, c.tau, { x: base.x, y: base.y, w: base.w, h: base.h, visible: base.visible, rot: baseRot }, true);
       });
       return true;
     }
-    // H: toggle visibility from current state
-    const cur = rr ? rr.visible : true;
-    const base = rr || (region.keys.length ? region.keys[0] : null);
-    if (!base) return false;
+    if (k === "h") {
+      const cur = rr ? rr.visible : true;
+      this.store.commit(() => {
+        this.writeKey(region, c.tau, { x: base.x, y: base.y, w: base.w, h: base.h, visible: !cur, rot: baseRot }, true);
+      });
+      return true;
+    }
+    // rotation: Q = -5°, E = +5°, R = reset to 0
+    let nextRot = baseRot;
+    if (k === "q") nextRot = baseRot - ROT_STEP;
+    else if (k === "e") nextRot = baseRot + ROT_STEP;
+    else nextRot = 0; // r
     this.store.commit(() => {
-      this.writeKey(region, c.tau, { x: base.x, y: base.y, w: base.w, h: base.h, visible: !cur }, true);
+      this.writeKey(region, c.tau, { x: base.x, y: base.y, w: base.w, h: base.h, visible: base.visible, rot: nextRot }, true);
     });
     return true;
   }
@@ -521,7 +576,11 @@ export class MosaicUI {
         return;
       }
       this.store.commit(() => {
-        for (const r of regions) clip.mosaics.push(r);
+        for (const r of regions) {
+          // backend JSON has no rot; default each key to 0
+          for (const key of r.keys) if (typeof key.rot !== "number") key.rot = 0;
+          clip.mosaics.push(r);
+        }
         if (regions.length) this.store.selectedRegionId = regions[regions.length - 1].id;
       });
       this.closeAutoModal(null);
@@ -604,4 +663,8 @@ export class MosaicUI {
 
 function clamp01(v: number): number {
   return Math.max(0, Math.min(1, v));
+}
+
+function clamp01p(p: { x: number; y: number }): { x: number; y: number } {
+  return { x: clamp01(p.x), y: clamp01(p.y) };
 }

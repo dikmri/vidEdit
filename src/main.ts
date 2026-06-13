@@ -172,8 +172,8 @@ window.addEventListener("keydown", (e) => {
     return;
   }
   if (isTyping()) return;
-  // mosaic keyframe shortcuts (K/H) when a clip + region is selected
-  if ((e.key === "k" || e.key === "K" || e.key === "h" || e.key === "H") && mosaicUI.handleKey(e.key)) {
+  // mosaic shortcuts (K/H keyframe, Q/E/R rotation) when a clip + region is selected
+  if ("khqerKHQER".includes(e.key) && mosaicUI.handleKey(e.key)) {
     e.preventDefault();
     return;
   }
